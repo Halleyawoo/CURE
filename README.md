@@ -3,4 +3,12 @@
 
 This repository contains the official implementation of **CURE**, our method for semi-supervised medical image segmentation.
 
-🔒 The full source code and pretrained weights will be released upon the acceptance/publication of the paper.
+📌 **Note**: The full source code and pretrained weights will be released upon the acceptance/publication of the paper.
+
+---
+
+## Citation
+If you find this work useful, please consider citing our paper (bibtex will be provided upon publication).
+
+## Contact
+For questions or collaborations, please open an issue or contact us.

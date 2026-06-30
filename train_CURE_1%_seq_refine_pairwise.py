@@ -14,7 +14,7 @@ from torch.distributions import Categorical
 from torchvision import transforms
 from tqdm import tqdm
 
-from dataloaders.dataset序列版本的 import (
+from dataloaders.datasetsequence import (
     BaseDataSets,
     TwoStreamBatchSampler,
     # WeakStrongAugment_Ours,
@@ -106,20 +106,22 @@ def get_current_consistency_weight(epoch):
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
-# 将序列中的图像两两组合：(im₁, im₂), (im₂, im₃), ..., (imₙ₋₁, imₙ)
-# 分别作为 weak/strong 对应输入，依次进行 forward / loss / refine
+# Pair consecutive augmented images:
+# (im1, im2), (im2, im3), ..., (im_{n-1}, im_n),
+# where each pair is treated as a weak/strong view pair.
 
-# 原始图像
-#    ↓
-# SequenceAugment → im1, im2, im3, im4, im5（增强强度逐步加深）
-#    ↓
-# 训练阶段：
-#    (im1, im2) → segmentation loss + refine loss
-#    (im2, im3) → segmentation loss + refine loss
-#    (im3, im4) → segmentation loss + refine loss
-#    (im4, im5) → segmentation loss + refine loss
-#    ↓
-# 累积所有 loss → backward + step
+# Original image
+#      ↓
+# SequenceAugment → im1, im2, im3, im4, im5
+# (augmentation strength increases progressively)
+#      ↓
+# Training:
+#      (im1, im2) → segmentation loss + refinement loss
+#      (im2, im3) → segmentation loss + refinement loss
+#      (im3, im4) → segmentation loss + refinement loss
+#      (im4, im5) → segmentation loss + refinement loss
+#      ↓
+# Accumulate all losses → backward() → optimizer.step()
 
 def train(args, snapshot_path):
     args_dict = vars(args)
@@ -296,8 +298,6 @@ def train(args, snapshot_path):
         for i_batch, sampled_batch in enumerate(trainloader):
 
 
-            # ##################### 替换部分 ####################
-            # 新的 sequence-based 数据结构
             image_sequence, label_batch = (
                 sampled_batch["image_sequence"],
                 sampled_batch["label_aug"],
@@ -306,13 +306,12 @@ def train(args, snapshot_path):
             label_batch = label_batch.cuda()
 
             B, N, C, H, W = image_sequence.shape
-            label_batch[args.labeled_bs:] = torch.zeros_like(label_batch[args.labeled_bs:])  # 屏蔽无标签部分
+            label_batch[args.labeled_bs:] = torch.zeros_like(label_batch[args.labeled_bs:])  
 
-            # 累积所有 pairwise 的损失
             total_loss = 0.0
             total_refine_loss = 0.0
 
-            # 遍历所有 (im_i, im_{i+1}) 的组合，累计所有的 loss
+            # Iterate over all (im_i, im_{i+1}) pairs and accumulate the losses.
             for i in range(N - 1):
                 weak_batch = image_sequence[:, i]
                 strong_batch = image_sequence[:, i + 1]
@@ -326,7 +325,6 @@ def train(args, snapshot_path):
                 outputs_weak_masked = outputs_weak_soft * pseudo_mask
                 pseudo_outputs = torch.argmax(outputs_weak_masked.detach(), dim=1)
 
-                # 一致性权重
                 consistency_weight = get_current_consistency_weight(iter_num // 150)
                 comp_loss, as_weight = get_comp_loss(weak=outputs_weak_soft, strong=outputs_strong_soft)
 
@@ -345,7 +343,7 @@ def train(args, snapshot_path):
 
                 total_loss += sup_loss + consistency_weight * unsup_loss
 
-                # --- refine 部分 ---
+                # --- refine ---
                 pseudo_mask_strong = (normalize(outputs_strong_soft) > args.conf_thresh).float()
                 outputs_strong_masked = outputs_strong_soft * pseudo_mask_strong
                 pseudo_outputs_strong = torch.argmax(outputs_strong_masked.detach(), dim=1)
@@ -397,7 +395,6 @@ def train(args, snapshot_path):
                 ref_consistency_weight = consistency_weight if args.ref_consistency_weight == -1 else args.ref_consistency_weight
                 total_refine_loss += sup_loss_ref + ref_consistency_weight * unsup_loss_ref
 
-            # 优化器更新
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -406,24 +403,18 @@ def train(args, snapshot_path):
             total_refine_loss.backward()
             refine_optimizer.step()
 
-            # ##################### 替换部分 ####################
 
-
-            ############################ 
-            # (c) Rectification loss for segmentation model
             if iter_num > args.refine_start:
                 for i in range(N - 1):
                     weak_batch = image_sequence[:, i]       # im_i
                     strong_batch = image_sequence[:, i + 1] # im_{i+1}
 
-                    # 伪标签准备
                     outputs_weak = model(weak_batch)
                     outputs_weak_soft = torch.softmax(outputs_weak, dim=1)
                     pseudo_mask = (normalize(outputs_weak_soft) > args.conf_thresh).float()
                     outputs_weak_masked = outputs_weak_soft * pseudo_mask
                     pseudo_outputs = torch.argmax(outputs_weak_masked.detach(), dim=1)
 
-                    # refine 模型输出伪标签（不计算 loss，只 forward）
                     pseudo_outputs_numpy = pseudo_outputs.cpu().numpy()
                     pseudo_outputs_color = pl_weak_embed(color_map, pseudo_outputs_numpy)
 
@@ -433,12 +424,10 @@ def train(args, snapshot_path):
                     ref_outputs = refine_model(pseudo_outputs_color.cuda(), t, weak_batch.cuda(), training=False)
                     ref_outputs_soft = torch.softmax(ref_outputs, dim=1)
 
-                    # refine 输出伪标签 -> rectify segmentation
                     pseudo_mask = (normalize(ref_outputs_soft) > args.conf_thresh).float()
                     ref_outputs_soft_masked = ref_outputs_soft * pseudo_mask
                     pseudo_outputs_ref = torch.argmax(ref_outputs_soft_masked.detach(), dim=1)
 
-                    # 再走一次 segmentation 的 weak forward（新的计算图）
                     outputs_weak_again = model(weak_batch)
                     outputs_weak_soft_again = torch.softmax(outputs_weak_again, dim=1)
 
@@ -453,7 +442,6 @@ def train(args, snapshot_path):
                     unsup_label_rect_loss.backward()
                     optimizer.step()
 
-            # ##################### 替换部分 ####################
 
             # update learning rate
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
@@ -502,10 +490,8 @@ def train(args, snapshot_path):
                     % (iter_num, performance, mean_hd95, mean_jaccard)
                 )
                 
-                ###############
                 # TEST, only use the result of the best val model
                 # test_func(num_classes, db_test, model, refine_model, iter_num, testloader)
-                ########################################################
 
                 model.train()
                 refine_model.train()
